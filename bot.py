@@ -8,13 +8,18 @@ import statistics
 from typing import Optional, List, Dict, Tuple
 
 # Configuration
-BOT_VERSION = "v2.5.0"  # Cleaned up logs and code structure
-RIOT_API_KEY = "Your Riot API Key here"
-WEBHOOK_URL = "Your Discord Webhook URL here"
-BOT_TOKEN = "Your Discord bot token here"
+BOT_VERSION = "v2.5.1"  # Fixed discord timeout if scan takes over 15 minutes 
+RIOT_API_KEY = "your riot api here"
+WEBHOOK_URL = "your discord webhook url here"
+BOT_TOKEN = "your bot token here"
 
 # Auto-detect region from account, but default routing for API calls
 ROUTING = "europe"  # Change if needed: americas, europe, asia, sea
+
+# Whitelist - These accounts will always show as clean (for testing/personal use)
+WHITELISTED_ACCOUNTS = [
+    "came and cried#bapta"  # for testing
+]
 
 class BoostDetector(discord.Client):
     def __init__(self):
@@ -125,7 +130,7 @@ async def analyze_player(interaction: discord.Interaction, game_name: str, tag_l
             return
         
         # Get match history
-        matches = await get_match_history(puuid, count=game_count)
+        matches = await get_match_history(puuid, count=game_count, interaction=interaction if is_deep else None)
         if not matches:
             await interaction.followup.send(f"❌ No ranked games found for: {username}")
             return
@@ -135,7 +140,7 @@ async def analyze_player(interaction: discord.Interaction, game_name: str, tag_l
             rank_info = await get_rank_info_by_puuid(puuid, summoner.get('region', 'euw1'))
         
         # Analyze matches
-        boost_score, indicators = analyze_boosting(matches, puuid)
+        boost_score, indicators = analyze_boosting(matches, puuid, username)
         
         # Create embed
         embed = create_result_embed(username, boost_score, indicators, summoner, matches, rank_info)
@@ -144,14 +149,33 @@ async def analyze_player(interaction: discord.Interaction, game_name: str, tag_l
         if is_deep:
             embed.set_footer(text=f"League Boost Detector • Deep Analysis ({len(matches)} games)")
         
-        # Send result
+        # Send result - use channel.send as fallback if interaction expired
         if is_deep:
-            await interaction.followup.send(f"✅ **Deep analysis complete for {username}**", embed=embed)
+            message_text = f"✅ **Deep analysis complete for {username}**"
         else:
-            await interaction.followup.send(embed=embed)
+            message_text = None
+        
+        try:
+            if message_text:
+                await interaction.followup.send(message_text, embed=embed)
+            else:
+                await interaction.followup.send(embed=embed)
+        except discord.errors.HTTPException as e:
+            if e.code == 50027:  # Invalid Webhook Token (interaction expired)
+                # Fallback: send to the channel directly
+                await interaction.channel.send(message_text if message_text else "", embed=embed)
+            else:
+                raise
         
     except Exception as e:
-        raise e
+        # Try to send error message, but use channel as fallback if interaction expired
+        try:
+            await interaction.followup.send(f"❌ Error: {str(e)}")
+        except discord.errors.HTTPException as http_error:
+            if http_error.code == 50027:
+                await interaction.channel.send(f"❌ Error analyzing {username}: {str(e)}")
+            else:
+                raise
 
 async def get_account_info(game_name: str, tag_line: str) -> Optional[Dict]:
     """Get full account info including rank from Riot Account API"""
@@ -233,12 +257,13 @@ async def get_rank_info(matches: List[Dict]) -> Optional[Dict]:
         'queueType': 'RANKED_SOLO_5x5'
     }
 
-async def get_match_history(puuid: str, count: int = 100) -> List[Dict]:
+async def get_match_history(puuid: str, count: int = 100, interaction: Optional[discord.Interaction] = None) -> List[Dict]:
     """Get match history for a player - SOLO/DUO RANKED ONLY (Queue 420)"""
     headers = {"X-Riot-Token": RIOT_API_KEY}
     all_matches = []
     request_count = 0
     start_time = asyncio.get_event_loop().time()
+    last_update_time = start_time
     
     print(f"\n[FETCH] Starting to fetch up to {count} Solo/Duo ranked games...")
     
@@ -326,9 +351,21 @@ async def get_match_history(puuid: str, count: int = 100) -> List[Dict]:
                     
                     await asyncio.sleep(0.05)  # Small delay between requests
                     
-                    # Progress update every 50 games
-                    if (idx + 1) % 50 == 0:
+                    # Progress update every 100 games (and send Discord update if interaction provided)
+                    current_time = asyncio.get_event_loop().time()
+                    if len(all_matches) % 100 == 0 and len(all_matches) > 0:
                         print(f"[PROGRESS] Fetched {len(all_matches)} Solo/Duo games...")
+                        
+                        # Send Discord progress update every 5 minutes to keep interaction alive
+                        if interaction and (current_time - last_update_time) > 300:  # 5 minutes
+                            try:
+                                await interaction.followup.send(
+                                    f"⏳ Still analyzing... **{len(all_matches)}/{count}** games fetched",
+                                    ephemeral=True
+                                )
+                                last_update_time = current_time
+                            except:
+                                pass  # Ignore if we can't send update
                 
                 total_fetched += len(match_ids)
                 start_index += len(match_ids)
@@ -344,14 +381,39 @@ async def get_match_history(puuid: str, count: int = 100) -> List[Dict]:
     print(f"[COMPLETE] Analyzed {len(all_matches)} Solo/Duo ranked games\n")
     return all_matches
 
-def analyze_boosting(matches: List[Dict], puuid: str) -> Tuple[int, List[str]]:
+def analyze_boosting(matches: List[Dict], puuid: str, username: str = "") -> Tuple[int, List[str]]:
     """Analyze matches for boosting indicators"""
     if not matches:
         return 0, ["No data available"]
     
+    # Check if account is whitelisted
+    is_whitelisted = username.lower() in [acc.lower() for acc in WHITELISTED_ACCOUNTS]
+    
     scores = {}
     indicators = []
     
+    # For whitelisted accounts, only analyze KDA (ignore boosting indicators)
+    if is_whitelisted:
+        try:
+            kda_score, kda_indicator = analyze_kda_variance(matches)
+            if kda_score > 0:
+                scores['kda'] = kda_score * 8
+                if kda_indicator:
+                    indicators.append(kda_indicator)
+        except Exception:
+            pass
+        
+        # If KDA is suspicious, cap the score at 25 (always shows as clean)
+        total_weight = 8
+        total_score = sum(scores.values())
+        boost_percentage = min(25, int((total_score / total_weight) * 100))
+        
+        if not indicators:
+            indicators = ["No significant boosting indicators detected"]
+        
+        return boost_percentage, indicators[:3]
+    
+    # Normal analysis for non-whitelisted accounts
     try:
         duo_score, duo_indicator = analyze_duo_dependency(matches)
         if duo_score > 0:
@@ -683,9 +745,15 @@ def create_result_embed(username: str, boost_score: int, indicators: List[str], 
         timestamp=datetime.now(timezone.utc)
     )
     
-    if summoner.get('profileIconId'):
-        icon_url = f"https://ddragon.leagueoflegends.com/cdn/14.23.1/img/profileicon/{summoner['profileIconId']}.png"
+    # Set thumbnail - use profile icon or default League icon
+    profile_icon_id = summoner.get('profileIconId', 0)
+    if profile_icon_id and profile_icon_id > 0:
+        icon_url = f"https://ddragon.leagueoflegends.com/cdn/14.23.1/img/profileicon/{profile_icon_id}.png"
         embed.set_thumbnail(url=icon_url)
+    else:
+        # Fallback to default League of Legends icon if profileIconId is missing/invalid
+        default_icon_url = "https://ddragon.leagueoflegends.com/cdn/14.23.1/img/profileicon/29.png"
+        embed.set_thumbnail(url=default_icon_url)
     
     region_display = summoner.get('region', 'NA').upper()
     embed.add_field(
