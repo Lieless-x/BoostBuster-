@@ -287,7 +287,7 @@ If you encounter issues:
 
 ```bash
 # 1. Clone and install
-git clone [<your-repo>](https://github.com/Lieless-x/BoostBuster-/)
+git clone [[https://github.com/Lieless-x/BoostBuster-/](https://github.com/Lieless-x/BoostBuster-/)](https://github.com/Lieless-x/BoostBuster-/)
 cd boostbuster
 pip install discord.py aiohttp
 
