@@ -1,4 +1,4 @@
-# 🔍 BoostBuster
+# 🔍 BoostBuster - Discord bot
 
 **A Discord bot that analyzes League of Legends ranked accounts for boosting indicators**
 
